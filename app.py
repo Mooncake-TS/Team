@@ -1,336 +1,399 @@
-# app.py
-# Streamlit - 리뷰 감정 분석 (만족/중립/부정) + 키워드 시각화 + 단일 리뷰 예측
-# - Repo에 Review.xlsx / Keyword.xlsx가 있으면 자동 로드
-# - 없으면 업로드 UI 표시
-# - Keyword.xlsx 컬럼: Sentiment / Keywords (또는 Keyword) 자동 인식
+# -*- coding: utf-8 -*-
+"""
+Streamlit Sentiment Dashboard (3-class: Positive/Neutral/Negative)
+
+- Auto-loads Review.xlsx / Keyword.xlsx if they exist next to this app.py (repo files)
+- Upload is optional (if uploaded, uploaded files take priority)
+- Trains baseline:
+  - Character n-gram TF-IDF (tokenizer 없이 한국어에 강함)
+  - + Lexicon features from Keyword.xlsx (키워드 매칭 카운트)
+  - Logistic Regression (liblinear: 구버전 sklearn 호환)
+
+Run:
+  streamlit run app.py
+"""
+
+from __future__ import annotations
 
 import io
-import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
 import streamlit as st
-import matplotlib.pyplot as plt
+from scipy import sparse
 
 from sklearn.model_selection import train_test_split
-from sklearn.pipeline import Pipeline
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import (
-    accuracy_score,
-    classification_report,
-    confusion_matrix,
-)
 
-# -------------------------
-# 기본 설정
-# -------------------------
-st.set_page_config(page_title="리뷰 감정 분석", layout="wide")
+# -----------------------------
+# Helpers: lexicon
+# -----------------------------
 
-DEFAULT_REVIEW_PATH = Path("Review.xlsx")
-DEFAULT_KEYWORD_PATH = Path("Keyword.xlsx")
+def _split_keywords(cell) -> List[str]:
+    if pd.isna(cell):
+        return []
+    return [k.strip() for k in str(cell).split(",") if k.strip()]
 
-# -------------------------
-# 유틸
-# -------------------------
-def normalize_text(s: str) -> str:
-    if s is None:
-        return ""
-    s = str(s)
-    s = s.replace("\u00a0", " ")
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-
-def find_col(df: pd.DataFrame, candidates: List[str]) -> str | None:
-    cols = {c.lower(): c for c in df.columns}
-    for cand in candidates:
-        if cand.lower() in cols:
-            return cols[cand.lower()]
-    return None
-
-
-def load_excel_from_repo_or_upload(label: str, default_path: Path) -> pd.DataFrame | None:
+def build_lexicon(keyword_df: pd.DataFrame) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
     """
-    Repo에 파일 있으면 그걸 읽고, 없으면 업로드 위젯을 보여준다.
+    Returns:
+      - sent_lex: sentiment -> keywords
+      - cat_lex:  category  -> keywords
+    Required columns: Sentiment, Category, Keywords
     """
-    if default_path.exists():
-        try:
-            return pd.read_excel(default_path)
-        except Exception as e:
-            st.error(f"❌ {default_path} 읽기 실패: {e}")
-            return None
-
-    st.warning(f"📌 리포지토리에 `{default_path.name}` 파일이 없어서 업로드가 필요해요.")
-    up = st.file_uploader(label, type=["xlsx"])
-    if up is None:
-        return None
-    try:
-        return pd.read_excel(up)
-    except Exception as e:
-        st.error(f"❌ 업로드 파일 읽기 실패: {e}")
-        return None
-
-
-def build_lexicon(df_kw: pd.DataFrame) -> Tuple[Dict[str, List[str]], List[str], str, str]:
-    """
-    Keyword.xlsx에서 감정별 키워드 사전을 만든다.
-    컬럼 자동 인식:
-      - 감정: Sentiment / 감정 / label / 라벨
-      - 키워드: Keywords / Keyword / 키워드
-    """
-    sentiment_col = find_col(df_kw, ["Sentiment", "sentiment", "감정", "label", "라벨"])
-    keyword_col = find_col(df_kw, ["Keywords", "keywords", "Keyword", "keyword", "키워드"])
-
-    if sentiment_col is None or keyword_col is None:
+    required = {"Sentiment", "Category", "Keywords"}
+    missing = required - set(keyword_df.columns)
+    if missing:
         raise ValueError(
-            f"Keyword.xlsx 컬럼을 찾지 못했어요. "
-            f"현재 컬럼: {list(df_kw.columns)} / "
-            f"필요 예: Sentiment(감정), Keywords(키워드)"
+            f"Keyword.xlsx에 필요한 컬럼이 없습니다: {sorted(missing)}\n"
+            f"현재 컬럼: {keyword_df.columns.tolist()}"
         )
 
-    df = df_kw[[sentiment_col, keyword_col]].copy()
-    df[sentiment_col] = df[sentiment_col].astype(str).map(normalize_text)
-    df[keyword_col] = df[keyword_col].astype(str).map(normalize_text)
+    sent_lex: Dict[str, List[str]] = {}
+    cat_lex: Dict[str, List[str]] = {}
 
-    # Keywords 컬럼이 "키워드1,키워드2,..." 형태일 수 있어서 분해
-    lex: Dict[str, List[str]] = {}
-    for _, row in df.iterrows():
-        sent = row[sentiment_col]
-        kws_raw = row[keyword_col]
-        if not sent or not kws_raw:
-            continue
+    for _, row in keyword_df.iterrows():
+        sent = str(row["Sentiment"]).strip()
+        cat = str(row["Category"]).strip()
+        kws = _split_keywords(row["Keywords"])
 
-        # 구분자: 쉼표/슬래시/세미콜론/파이프 등 대응
-        parts = re.split(r"[,\|/;]+", kws_raw)
-        parts = [p.strip() for p in parts if p.strip()]
-        if not parts:
-            continue
+        if sent:
+            sent_lex.setdefault(sent, []).extend(kws)
+        if cat:
+            cat_lex.setdefault(cat, []).extend(kws)
 
-        lex.setdefault(sent, [])
-        lex[sent].extend(parts)
-
-    # 중복 제거(순서 유지)
-    for k in list(lex.keys()):
+    def dedup(seq: List[str]) -> List[str]:
         seen = set()
-        uniq = []
-        for w in lex[k]:
-            if w not in seen:
-                seen.add(w)
-                uniq.append(w)
-        lex[k] = uniq
+        out = []
+        for s in seq:
+            if s not in seen:
+                out.append(s)
+                seen.add(s)
+        return out
 
-    sentiments = sorted(list(lex.keys()))
-    return lex, sentiments, sentiment_col, keyword_col
+    sent_lex = {k: dedup(v) for k, v in sent_lex.items()}
+    cat_lex = {k: dedup(v) for k, v in cat_lex.items()}
+    return sent_lex, cat_lex
 
+def lexicon_feature_matrix(texts: List[str], sent_lex: Dict[str, List[str]]) -> np.ndarray:
+    """
+    For each text, count keyword hits per sentiment.
+    Returns matrix shape (n_samples, n_sentiments)
+    """
+    sentiments = list(sent_lex.keys())
+    mat = np.zeros((len(texts), len(sentiments)), dtype=np.float32)
 
-def count_keyword_hits(texts: List[str], lex: Dict[str, List[str]]) -> pd.DataFrame:
-    rows = []
-    for sent, kws in lex.items():
-        for kw in kws:
-            kw = normalize_text(kw)
-            if not kw:
-                continue
-            cnt = sum(1 for t in texts if kw in t)
-            if cnt:
-                rows.append((sent, kw, cnt))
-    df = pd.DataFrame(rows, columns=["Sentiment", "Keyword", "Count"])
-    if df.empty:
-        return df
-    return df.sort_values(["Sentiment", "Count"], ascending=[True, False]).reset_index(drop=True)
+    for j, s in enumerate(sentiments):
+        kws = sent_lex[s]
+        if not kws:
+            continue
+        for i, t in enumerate(texts):
+            tt = t if isinstance(t, str) else ""
+            cnt = 0
+            for kw in kws:
+                if kw and kw in tt:
+                    cnt += 1
+            mat[i, j] = cnt
+    return mat
 
+# -----------------------------
+# Model wrapper
+# -----------------------------
 
-def plot_top_keywords(kw_hits: pd.DataFrame, top_n: int = 15):
-    if kw_hits.empty:
-        st.info("키워드 매칭 결과가 거의 없어요. Keyword.xlsx의 키워드를 더 늘리면 훨씬 잘 나와요.")
-        return
+@dataclass
+class SentimentModel:
+    vectorizer: TfidfVectorizer
+    clf: LogisticRegression
+    sentiments: List[str]          # order used in lexicon features
+    sent_lex: Dict[str, List[str]] # sentiment -> keywords
 
-    sentiments = kw_hits["Sentiment"].unique().tolist()
-    preferred_order = ["만족", "긍정", "중립", "부정"]
-    sentiments = sorted(sentiments, key=lambda x: preferred_order.index(x) if x in preferred_order else 999)
+    def featurize(self, texts: List[str]) -> sparse.csr_matrix:
+        X_tfidf = self.vectorizer.transform(texts)
+        X_lex = lexicon_feature_matrix(texts, self.sent_lex)
+        X_lex_sp = sparse.csr_matrix(X_lex)
+        return sparse.hstack([X_tfidf, X_lex_sp], format="csr")
 
-    fig, axes = plt.subplots(1, len(sentiments), figsize=(6 * len(sentiments), 4))
-    if len(sentiments) == 1:
-        axes = [axes]
+    def predict(self, texts: List[str]) -> np.ndarray:
+        X = self.featurize(texts)
+        return self.clf.predict(X)
 
-    for ax, sent in zip(axes, sentiments):
-        sub = kw_hits[kw_hits["Sentiment"] == sent].sort_values("Count", ascending=False).head(top_n)
-        ax.barh(sub["Keyword"][::-1], sub["Count"][::-1])
-        ax.set_title(f"{sent} 키워드 Top {top_n}")
-        ax.set_xlabel("Count")
-        ax.set_ylabel("Keyword")
+    def predict_proba(self, texts: List[str]) -> np.ndarray:
+        X = self.featurize(texts)
+        return self.clf.predict_proba(X)
 
-    plt.tight_layout()
-    st.pyplot(fig)
+def train_model(
+    df: pd.DataFrame,
+    keyword_df: pd.DataFrame,
+    text_col: str,
+    label_col: str,
+    test_size: float = 0.2,
+    seed: int = 42
+) -> Tuple[SentimentModel, dict]:
 
+    if text_col not in df.columns:
+        raise ValueError(f"Review.xlsx에 '{text_col}' 컬럼이 없습니다. 현재 컬럼: {df.columns.tolist()}")
+    if label_col not in df.columns:
+        raise ValueError(f"Review.xlsx에 '{label_col}' 컬럼이 없습니다. 현재 컬럼: {df.columns.tolist()}")
 
-def train_model(df_review: pd.DataFrame, text_col: str, label_col: str, test_size: float = 0.2, seed: int = 42):
-    X = df_review[text_col].astype(str).map(normalize_text)
-    y = df_review[label_col].astype(str).map(normalize_text)
+    # labels 정리(공백/NaN 제거)
+    work = df[[text_col, label_col]].copy()
+    work[text_col] = work[text_col].astype(str).fillna("").str.strip()
+    work[label_col] = work[label_col].astype(str).fillna("").str.strip()
+    work = work[(work[text_col] != "") & (work[label_col] != "")]
+    if len(work) < 10:
+        raise ValueError("학습 가능한 행이 너무 적어요. (리뷰/라벨 빈칸이 많을 수 있음)")
 
-    # 빈값 제거
-    mask = (X != "") & (y != "")
-    X = X[mask]
-    y = y[mask]
+    # build lexicon
+    sent_lex, _ = build_lexicon(keyword_df)
+    sentiments = list(sent_lex.keys())
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=test_size, random_state=seed, stratify=y if y.nunique() > 1 else None
+    texts = work[text_col].tolist()
+    labels = work[label_col].tolist()
+
+    # 클래스가 2개 미만이면 학습 불가
+    unique_labels = sorted(set(labels))
+    if len(unique_labels) < 2:
+        raise ValueError(f"라벨 종류가 1개뿐이라 학습이 안 됩니다. 현재 라벨: {unique_labels}")
+
+    # split (가능하면 stratify)
+    stratify = labels if len(unique_labels) > 1 else None
+    X_tr, X_te, y_tr, y_te = train_test_split(
+        texts, labels, test_size=test_size, random_state=seed, stratify=stratify
     )
 
-    # ⚠️ multi_class 파라미터는 환경에 따라 에러 나서 제거(너가 겪은 그 오류 방지)
-    clf = LogisticRegression(max_iter=3000)
-
-    model = Pipeline(
-        steps=[
-            ("tfidf", TfidfVectorizer(ngram_range=(1, 2), min_df=1)),
-            ("clf", clf),
-        ]
+    # TF-IDF: char n-gram
+    vectorizer = TfidfVectorizer(
+        analyzer="char",
+        ngram_range=(2, 5),
+        min_df=1,
+        max_features=30000
     )
+    X_tr_tfidf = vectorizer.fit_transform(X_tr)
+    X_te_tfidf = vectorizer.transform(X_te)
 
-    model.fit(X_train, y_train)
-    pred = model.predict(X_test)
+    # Lexicon features
+    X_tr_lex = sparse.csr_matrix(lexicon_feature_matrix(X_tr, sent_lex))
+    X_te_lex = sparse.csr_matrix(lexicon_feature_matrix(X_te, sent_lex))
 
-    metrics = {
-        "accuracy": float(accuracy_score(y_test, pred)),
-        "report": classification_report(y_test, pred, output_dict=False),
-        "confusion": confusion_matrix(y_test, pred).tolist(),
-        "labels": sorted(y.unique().tolist()),
-        "test_size": len(X_test),
-        "train_size": len(X_train),
-    }
-    return model, metrics, (X_test, y_test, pred)
+    X_tr_all = sparse.hstack([X_tr_tfidf, X_tr_lex], format="csr")
+    X_te_all = sparse.hstack([X_te_tfidf, X_te_lex], format="csr")
 
+    clf = LogisticRegression(
+        max_iter=3000,
+        solver="liblinear"  # 구버전 sklearn 호환
+    )
+    clf.fit(X_tr_all, y_tr)
 
-# -------------------------
-# UI
-# -------------------------
+    y_pred = clf.predict(X_te_all)
+    acc = accuracy_score(y_te, y_pred)
+    report = classification_report(y_te, y_pred, output_dict=True, zero_division=0)
+    cm = confusion_matrix(y_te, y_pred, labels=unique_labels)
+
+    model = SentimentModel(vectorizer=vectorizer, clf=clf, sentiments=sentiments, sent_lex=sent_lex)
+    metrics = {"accuracy": acc, "report": report, "labels": unique_labels, "cm": cm}
+    return model, metrics
+
+# -----------------------------
+# Streamlit UI
+# -----------------------------
+
+st.set_page_config(page_title="리뷰 감정 분석 대시보드", layout="wide")
 st.title("리뷰 감정 분석 (만족 / 중립 / 부정)")
 
-left, right = st.columns([1, 3])
+APP_DIR = Path(__file__).resolve().parent
+DEFAULT_REVIEW = APP_DIR / "Review.xlsx"
+DEFAULT_KEYWORD = APP_DIR / "Keyword.xlsx"
 
-with left:
-    st.header("데이터 로드")
-    st.caption("Repo에 Review.xlsx, Keyword.xlsx가 있으면 자동으로 읽고, 없으면 업로드 UI가 떠요.")
+@st.cache_data(show_spinner=False)
+def load_excel_from_path(p: Path) -> pd.DataFrame:
+    return pd.read_excel(p)
 
-    df_review = load_excel_from_repo_or_upload("Review.xlsx 업로드", DEFAULT_REVIEW_PATH)
-    df_kw = load_excel_from_repo_or_upload("Keyword.xlsx 업로드", DEFAULT_KEYWORD_PATH)
+@st.cache_data(show_spinner=False)
+def load_excel_from_upload(uploaded) -> pd.DataFrame:
+    return pd.read_excel(uploaded)
 
-    st.divider()
-    st.header("설정")
+with st.sidebar:
+    st.header("1) 파일")
+    st.caption("✅ 레포에 Review.xlsx / Keyword.xlsx가 있으면 자동으로 읽어요.\n(업로드하면 업로드 파일이 우선입니다)")
+    review_file = st.file_uploader("Review.xlsx 업로드(선택)", type=["xlsx"], accept_multiple_files=False)
+    keyword_file = st.file_uploader("Keyword.xlsx 업로드(선택)", type=["xlsx"], accept_multiple_files=False)
 
-    test_size = st.slider("테스트 비율", 0.1, 0.5, 0.2, 0.05)
-    seed = st.number_input("랜덤 시드", value=42, step=1)
+    st.header("2) 컬럼 설정")
+    text_col = st.text_input("리뷰 텍스트 컬럼명", value="Review")
+    label_col = st.text_input("라벨 컬럼명(학습용)", value="Sentiment")
+    test_size = st.slider("검증(Test) 비율", min_value=0.1, max_value=0.4, value=0.2, step=0.05)
 
-with right:
-    if df_review is None or df_kw is None:
-        st.info("왼쪽에서 Review.xlsx / Keyword.xlsx를 준비하면 여기서 분석이 진행돼요.")
-        st.stop()
+    st.header("3) 실행")
+    train_btn = st.button("모델 학습 & 평가")
 
-    st.subheader("데이터 미리보기")
-    c1, c2 = st.columns(2)
-    with c1:
-        st.caption("Review.xlsx (상위 10개)")
-        st.dataframe(df_review.head(10), use_container_width=True)
-    with c2:
-        st.caption("Keyword.xlsx (상위 10개)")
-        st.dataframe(df_kw.head(10), use_container_width=True)
+# ---- Load files (upload > local repo) ----
+df_review: Optional[pd.DataFrame] = None
+df_kw: Optional[pd.DataFrame] = None
 
-    # Review 컬럼 자동 추정
-    text_col_guess = find_col(df_review, ["Review", "review", "리뷰", "text", "텍스트", "내용"])
-    label_col_guess = find_col(df_review, ["Sentiment", "sentiment", "감정", "label", "라벨"])
+load_msgs = []
 
-    st.divider()
-    st.subheader("컬럼 선택")
-    colA, colB = st.columns(2)
-    with colA:
-        text_col = st.selectbox("리뷰 텍스트 컬럼", options=list(df_review.columns), index=(list(df_review.columns).index(text_col_guess) if text_col_guess in df_review.columns else 0))
-    with colB:
-        label_col = st.selectbox("감정 라벨 컬럼", options=list(df_review.columns), index=(list(df_review.columns).index(label_col_guess) if label_col_guess in df_review.columns else 0))
+try:
+    if review_file is not None:
+        df_review = load_excel_from_upload(review_file)
+        load_msgs.append("Review.xlsx: 업로드 파일 사용")
+    elif DEFAULT_REVIEW.exists():
+        df_review = load_excel_from_path(DEFAULT_REVIEW)
+        load_msgs.append(f"Review.xlsx: 레포 파일 사용 ({DEFAULT_REVIEW.name})")
 
-    # -------------------------
-    # 키워드 분석 (Keywords 지원!)
-    # -------------------------
-    st.divider()
-    st.subheader("키워드 분석 (Keyword.xlsx 기준)")
+    if keyword_file is not None:
+        df_kw = load_excel_from_upload(keyword_file)
+        load_msgs.append("Keyword.xlsx: 업로드 파일 사용")
+    elif DEFAULT_KEYWORD.exists():
+        df_kw = load_excel_from_path(DEFAULT_KEYWORD)
+        load_msgs.append(f"Keyword.xlsx: 레포 파일 사용 ({DEFAULT_KEYWORD.name})")
+except Exception as e:
+    st.error(f"엑셀 로딩 중 오류: {e}")
+    st.stop()
 
-    try:
-        sent_lex, sentiments_list, s_col, k_col = build_lexicon(df_kw)
+if df_review is None or df_kw is None:
+    st.warning(
+        "Review.xlsx / Keyword.xlsx를 찾지 못했어요.\n\n"
+        "✅ 해결 방법:\n"
+        "- 레포(프로젝트) 루트에 **Review.xlsx, Keyword.xlsx**를 올리기\n"
+        "- 또는 왼쪽 사이드바에서 업로드하기"
+    )
+    st.stop()
 
-        texts_all = [normalize_text(t) for t in df_review[text_col].astype(str).fillna("").tolist()]
-        kw_hits = count_keyword_hits(texts_all, sent_lex)
+st.success(" / ".join(load_msgs))
 
-        cc1, cc2 = st.columns(2)
-        with cc1:
-            st.caption("전체 Top 30")
-            if not kw_hits.empty:
-                st.dataframe(kw_hits.sort_values("Count", ascending=False).head(30), use_container_width=True)
-            else:
-                st.write("매칭 결과 없음")
-        with cc2:
-            st.caption("감정별 Top 10")
-            if not kw_hits.empty:
-                st.dataframe(kw_hits.groupby("Sentiment").head(10), use_container_width=True)
-            else:
-                st.write("매칭 결과 없음")
+# ---- Preview ----
+st.subheader("데이터 미리보기")
+c1, c2 = st.columns(2)
+with c1:
+    st.caption("Review.xlsx")
+    st.dataframe(df_review.head(10), use_container_width=True)
+with c2:
+    st.caption("Keyword.xlsx")
+    st.dataframe(df_kw.head(10), use_container_width=True)
 
-        st.subheader("감정별 키워드 시각화")
-        top_n = st.slider("그래프에 표시할 키워드 개수(감정별)", 5, 30, 15, 1)
-        plot_top_keywords(kw_hits, top_n=top_n)
+# quick stats
+if text_col in df_review.columns:
+    st.write(f"- 리뷰 개수: **{len(df_review)}**")
+if label_col in df_review.columns:
+    vc = df_review[label_col].astype(str).fillna("").str.strip()
+    vc = vc[vc != ""].value_counts()
+    st.write("- 라벨 분포(빈칸 제외):")
+    st.dataframe(vc.rename("count").to_frame(), use_container_width=True)
+else:
+    st.info(f"라벨 컬럼 '{label_col}' 이(가) 없으면 학습/평가가 불가해요. (예측만 하려면 학습된 모델이 필요)")
 
-    except Exception as e:
-        st.warning(f"키워드 분석을 건너뛰었어요. ❌ {e}")
+if not train_btn:
+    st.warning("왼쪽에서 **모델 학습 & 평가** 버튼을 눌러야 예측 기능이 활성화돼요.")
+    st.stop()
 
-    # -------------------------
-    # 모델 학습
-    # -------------------------
-    st.divider()
-    st.subheader("모델 학습/평가")
+# ---- Train ----
+try:
+    with st.spinner("학습 중..."):
+        model, metrics = train_model(df_review, df_kw, text_col, label_col, test_size=test_size, seed=42)
+except Exception as e:
+    st.error(f"학습 실패: {e}")
+    st.stop()
 
-    if st.button("학습 실행"):
-        with st.spinner("학습 중..."):
-            model, metrics, test_pack = train_model(df_review, text_col, label_col, test_size=test_size, seed=int(seed))
+st.success(f"완료! Test Accuracy = {metrics['accuracy']:.3f}")
 
-        st.success("✅ 학습 완료!")
-        st.write(f"- Train: {metrics['train_size']}개 / Test: {metrics['test_size']}개")
-        st.write(f"- Accuracy: **{metrics['accuracy']:.4f}**")
+# Confusion matrix + report (그래프 없이 표로만)
+labels = metrics["labels"]
+cm = metrics["cm"]
+cm_df = pd.DataFrame(cm, index=[f"Actual:{l}" for l in labels], columns=[f"Pred:{l}" for l in labels])
 
-        st.caption("분류 리포트")
-        st.code(metrics["report"])
+c1, c2 = st.columns([1, 1])
+with c1:
+    st.subheader("혼동행렬(Confusion Matrix)")
+    st.dataframe(cm_df, use_container_width=True)
 
-        # -------------------------
-        # 단일 리뷰 입력 → 예측 (요청사항 2번)
-        # -------------------------
-        st.divider()
-        st.subheader("리뷰 한 줄 입력 → 감정 예측")
+with c2:
+    st.subheader("분류 리포트")
+    report_df = pd.DataFrame(metrics["report"]).T
+    st.dataframe(report_df, use_container_width=True)
 
-        user_text = st.text_area(
-            "리뷰를 입력하세요",
-            placeholder="예) 기사님이 너무 친절하고 시간도 정확했어요!",
-            height=120,
-        )
+st.divider()
 
-        if st.button("예측하기"):
-            txt = normalize_text(user_text)
-            if not txt:
-                st.warning("리뷰 내용을 입력해줘!")
-            else:
-                pred_label = model.predict([txt])[0]
-                st.write(f"### 예측 결과: **{pred_label}**")
+# ---- Predict all rows ----
+st.subheader("전체 리뷰 예측 결과(상위 일부)")
+texts_all = df_review[text_col].astype(str).fillna("").tolist()
+proba = model.predict_proba(texts_all)
+pred = model.predict(texts_all)
 
-                if hasattr(model, "predict_proba"):
-                    probs = model.predict_proba([txt])[0]
-                    classes = model.named_steps["clf"].classes_
-                    prob_df = (
-                        pd.DataFrame({"label": classes, "prob": probs})
-                        .sort_values("prob", ascending=False)
-                        .reset_index(drop=True)
-                    )
-                    st.caption("라벨별 확률")
-                    st.dataframe(prob_df, use_container_width=True)
-                    st.bar_chart(prob_df.set_index("label")["prob"])
+proba_df = pd.DataFrame(proba, columns=[f"p_{c}" for c in model.clf.classes_])
+out_df = df_review.copy()
+out_df["Pred_Sentiment"] = pred
+out_df = pd.concat([out_df, proba_df], axis=1)
 
-        st.caption("Tip: 정확도가 낮으면 Review.xlsx 라벨 품질/데이터 수가 제일 크게 영향을 줘요.")
+st.dataframe(out_df.head(30), use_container_width=True)
+
+st.divider()
+
+# ---- One-line input predict ----
+st.subheader("리뷰 한 줄 입력 → 감정 예측")
+user_text = st.text_area("리뷰를 입력하세요", placeholder="예) 기사님이 너무 친절하고 시간도 정확했어요!", height=120)
+do_pred = st.button("예측하기")
+
+if do_pred:
+    txt = (user_text or "").strip()
+    if not txt:
+        st.warning("리뷰 내용을 입력해줘!")
     else:
-        st.info("위에서 컬럼을 고른 뒤, '학습 실행' 버튼을 눌러줘.")
+        pred_label = model.predict([txt])[0]
+        proba1 = model.predict_proba([txt])[0]
+        classes = list(model.clf.classes_)
+        proba_table = pd.DataFrame({"class": classes, "prob": proba1}).sort_values("prob", ascending=False)
+
+        st.write(f"### ✅ 예측 결과: **{pred_label}**")
+        st.dataframe(proba_table, use_container_width=True)
+
+st.divider()
+
+# ---- Keyword hit table (그래프 없이 표만) ----
+st.subheader("키워드 히트 Top (표로만 표시)")
+try:
+    sent_lex, _ = build_lexicon(df_kw)
+    rows = []
+    for sent, kws in sent_lex.items():
+        for kw in kws:
+            if not kw:
+                continue
+            cnt = sum(1 for t in texts_all if kw in t)
+            if cnt:
+                rows.append((sent, kw, cnt))
+
+    if rows:
+        kw_hits = (
+            pd.DataFrame(rows, columns=["Sentiment", "Keyword", "Count"])
+            .sort_values(["Sentiment", "Count"], ascending=[True, False])
+        )
+        c1, c2 = st.columns(2)
+        with c1:
+            st.caption("전체 Top 30")
+            st.dataframe(kw_hits.sort_values("Count", ascending=False).head(30), use_container_width=True)
+        with c2:
+            st.caption("감정별 Top 10")
+            st.dataframe(kw_hits.groupby("Sentiment").head(10), use_container_width=True)
+    else:
+        st.info("데이터에서 Keyword.xlsx 키워드 매칭이 거의 없어요. (표현/띄어쓰기/키워드 범위를 조금 넓히면 좋아요)")
+except Exception as e:
+    st.warning(f"키워드 분석은 건너뛰었어요: {e}")
+
+# ---- Download ----
+st.subheader("결과 다운로드")
+buf = io.BytesIO()
+with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+    out_df.to_excel(writer, index=False, sheet_name="predictions")
+    cm_df.to_excel(writer, sheet_name="confusion_matrix")
+buf.seek(0)
+
+st.download_button(
+    label="예측 결과 Excel 다운로드",
+    data=buf,
+    file_name="review_predictions.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+)
